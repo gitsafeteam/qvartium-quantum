@@ -26,7 +26,7 @@ Env:
 
 Targets qiskit >= 1.0 (works on 2.x) + qiskit-ibm-runtime >= 0.30 (SamplerV2).
 """
-import os, time, logging
+import os, time, logging, concurrent.futures
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -157,14 +157,27 @@ def health():
         "hint": "open /backends to test the IBM connection (can take ~30s; needs IBM_INSTANCE set)",
     }
 
+def _run_with_timeout(fn, seconds):
+    """Run a blocking IBM call with a hard timeout so the HTTP request never hangs.
+    The underlying thread may keep running (qiskit calls can't be killed), but we return."""
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    try:
+        return fut.result(timeout=seconds)
+    finally:
+        ex.shutdown(wait=False)
+
 @app.get("/backends")
 def list_backends():
     """Public — actually contacts IBM and lists real devices. Slow if IBM_INSTANCE is missing/invalid."""
     if not os.environ.get("IBM_QUANTUM_TOKEN"):
         return {"ok": False, "error": "IBM_QUANTUM_TOKEN missing"}
     try:
-        names = [b.name for b in service().backends(operational=True, simulator=False)]
+        names = _run_with_timeout(lambda: [b.name for b in service().backends(operational=True, simulator=False)], 35)
         return {"ok": True, "instance_set": bool(IBM_INSTANCE), "backends": names}
+    except concurrent.futures.TimeoutError:
+        return {"ok": False, "instance_set": bool(IBM_INSTANCE),
+                "error": "timed out after 35s contacting IBM. The instance is set but cannot list devices \u2014 likely the instance has no quantum systems attached / is not Active yet. On quantum.cloud.ibm.com open the instance and check it is Active and lists systems."}
     except Exception as e:
         return {"ok": False, "instance_set": bool(IBM_INSTANCE), "error": f"{type(e).__name__}: {e}"}
 
@@ -173,7 +186,13 @@ def submit(req: CircuitReq, authorization: str = Header(default=""), x_qv_key: s
     guard(authorization, x_qv_key)
     qc = build_circuit(req)
     try:
-        backend = pick_backend(req.qubits)
+        backend = _run_with_timeout(lambda: pick_backend(req.qubits), 45)
+    except concurrent.futures.TimeoutError:
+        raise HTTPException(status_code=504, detail="ibm_timeout: backend selection timed out (instance not responding)")
+    except Exception as e:
+        log.exception("[submit] pick_backend failed")
+        raise HTTPException(status_code=502, detail=f"backend_failed: {type(e).__name__}: {e}")
+    try:
         tqc = transpile(qc, backend=backend, optimization_level=1)
         sampler = Sampler(mode=backend)
         job = sampler.run([tqc], shots=int(req.shots))
