@@ -2,3 +2,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 qiskit>=1.0
 qiskit-ibm-runtime>=0.30
+pyjwt[crypto]>=2.8

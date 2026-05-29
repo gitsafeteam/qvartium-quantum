@@ -1,43 +1,67 @@
 """
 Qvartium — REAL quantum execution backend (IBM Quantum / Qiskit Runtime).
 
-This is a small async service: the dApp submits a circuit (as a gate list),
-this service runs it on a REAL IBM QPU and returns real measurement counts.
+The dApp calls this service DIRECTLY (no Netlify proxy) so the browser can wait
+out cold starts / IBM init without hitting a serverless timeout.
 
-It is intentionally separate from the Netlify (Node) functions because
-qiskit-ibm-runtime is Python. Deploy it on a Python host (Render / Railway / Fly).
+Auth (either works):
+  - Authorization: Bearer <Privy access token>   (verified against your Privy app)
+  - x-qv-key: <QV_BACKEND_KEY>                    (shared-secret, e.g. for a proxy)
 
 Endpoints:
   POST /submit   {gates, qubits, shots}  -> {job_id, backend}
   GET  /status/{job_id}                  -> {status, counts?, backend}
   GET  /health                           -> {ok, backends}
 
-Auth: set a shared secret QV_BACKEND_KEY; the dApp/Netlify sends it as
-header `x-qv-key`. The IBM token lives only here (IBM_QUANTUM_TOKEN), never in the frontend.
+Env:
+  IBM_QUANTUM_TOKEN  (secret) — your IBM API key
+  PRIVY_APP_ID       — your Privy app id (public) e.g. cmppnoqxk00u10cl2r201hqhq
+  QV_BACKEND_KEY     (optional) — shared secret fallback
+  PUBLIC_URL         — https://app.qvartium.xyz (for CORS)
+  IBM_INSTANCE       (optional) — CRN if your account needs it
 
-NOTE: Qiskit's API evolves. This targets qiskit >= 1.0 and
-qiskit-ibm-runtime >= 0.30 (SamplerV2). If your versions differ, adjust the
-service init / result parsing per IBM's current docs:
-https://quantum.cloud.ibm.com/docs
+Targets qiskit >= 1.0 (works on 2.x) + qiskit-ibm-runtime >= 0.30 (SamplerV2).
 """
-import os, uuid
+import os, time
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import jwt
+from jwt import PyJWKClient
 from qiskit import QuantumCircuit, transpile
 from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 
 app = FastAPI(title="Qvartium Quantum Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.environ.get("PUBLIC_URL", "*")],
+    allow_origins=[os.environ.get("PUBLIC_URL", "*"), "*"],
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- IBM Quantum service (token from env; never hardcode) ---
-# The newest IBM Quantum Platform uses channel="ibm_quantum_platform".
-# If your account needs an instance, pass instance="<CRN>".
+# ---------- auth ----------
+PRIVY_APP_ID = os.environ.get("PRIVY_APP_ID", "")
+_jwks = PyJWKClient(f"https://auth.privy.io/api/v1/apps/{PRIVY_APP_ID}/jwks.json") if PRIVY_APP_ID else None
+
+def authorized(authorization: str, x_qv_key: str) -> bool:
+    expected = os.environ.get("QV_BACKEND_KEY")
+    if expected and x_qv_key == expected:
+        return True
+    if _jwks and authorization:
+        token = authorization.replace("Bearer ", "").strip()
+        try:
+            key = _jwks.get_signing_key_from_jwt(token).key
+            jwt.decode(token, key, algorithms=["ES256"], audience=PRIVY_APP_ID, issuer="privy.io")
+            return True
+        except Exception:
+            return False
+    return not expected and not _jwks  # if nothing configured (dev), allow
+
+def guard(authorization, x_qv_key):
+    if not authorized(authorization, x_qv_key):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+# ---------- IBM service (cached) ----------
 _service = None
 def service():
     global _service
@@ -49,10 +73,20 @@ def service():
         )
     return _service
 
+_backend_cache = {"b": None, "ts": 0.0}
+def pick_backend(min_qubits):
+    now = time.time()
+    b = _backend_cache["b"]
+    if b is not None and (now - _backend_cache["ts"]) < 300 and b.num_qubits >= min_qubits:
+        return b
+    b = service().least_busy(operational=True, simulator=False, min_num_qubits=max(2, min_qubits))
+    _backend_cache.update(b=b, ts=now)
+    return b
+
 JOBS = {}  # job_id -> {"backend": name}
 
 class CircuitReq(BaseModel):
-    gates: list   # e.g. [{"op":"h","q":0},{"op":"cx","c":0,"t":1},{"op":"measure"}]
+    gates: list
     qubits: int
     shots: int = 1024
 
@@ -73,17 +107,15 @@ def build_circuit(req: CircuitReq) -> QuantumCircuit:
             getattr(qc, op)(float(g.get("theta", 1.5707963)), int(g["q"]))
         elif op == "measure":
             measured = True
-    qc.measure_all() if not measured else qc.measure(range(n), range(n))
+    if measured:
+        qc.measure(range(n), range(n))
+    else:
+        qc.measure_all()
     return qc
 
-def _check(key):
-    expected = os.environ.get("QV_BACKEND_KEY")
-    if expected and key != expected:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
 @app.get("/health")
-def health(x_qv_key: str = Header(default="")):
-    _check(x_qv_key)
+def health(authorization: str = Header(default=""), x_qv_key: str = Header(default="")):
+    guard(authorization, x_qv_key)
     try:
         names = [b.name for b in service().backends(operational=True, simulator=False)]
         return {"ok": True, "backends": names}
@@ -91,12 +123,11 @@ def health(x_qv_key: str = Header(default="")):
         return {"ok": False, "error": str(e)}
 
 @app.post("/submit")
-def submit(req: CircuitReq, x_qv_key: str = Header(default="")):
-    _check(x_qv_key)
+def submit(req: CircuitReq, authorization: str = Header(default=""), x_qv_key: str = Header(default="")):
+    guard(authorization, x_qv_key)
     qc = build_circuit(req)
     try:
-        backend = service().least_busy(operational=True, simulator=False,
-                                       min_num_qubits=max(2, req.qubits))
+        backend = pick_backend(req.qubits)
         tqc = transpile(qc, backend=backend, optimization_level=1)
         sampler = Sampler(mode=backend)
         job = sampler.run([tqc], shots=int(req.shots))
@@ -107,19 +138,17 @@ def submit(req: CircuitReq, x_qv_key: str = Header(default="")):
         raise HTTPException(status_code=502, detail=f"submit_failed: {e}")
 
 @app.get("/status/{job_id}")
-def status(job_id: str, x_qv_key: str = Header(default="")):
-    _check(x_qv_key)
+def status(job_id: str, authorization: str = Header(default=""), x_qv_key: str = Header(default="")):
+    guard(authorization, x_qv_key)
     try:
         job = service().job(job_id)
         st = str(job.status())
-        if "DONE" in st or st == "JobStatus.DONE":
+        if "DONE" in st:
             res = job.result()
-            # SamplerV2: counts live under the measured register (measure_all -> 'meas')
             data = res[0].data
             reg = "meas" if hasattr(data, "meas") else next(iter(vars(data)))
             counts = getattr(data, reg).get_counts()
-            return {"status": "COMPLETED", "counts": counts,
-                    "backend": JOBS.get(job_id, {}).get("backend")}
+            return {"status": "COMPLETED", "counts": counts, "backend": JOBS.get(job_id, {}).get("backend")}
         if "ERROR" in st or "CANCEL" in st:
             return {"status": "FAILED", "detail": st}
         return {"status": "RUNNING"}
