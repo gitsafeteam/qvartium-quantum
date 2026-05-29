@@ -40,22 +40,27 @@ app.add_middleware(
 )
 
 # ---------- auth ----------
-PRIVY_APP_ID = os.environ.get("PRIVY_APP_ID", "")
+PRIVY_APP_ID = os.environ.get("PRIVY_APP_ID", "").strip()
 _jwks = PyJWKClient(f"https://auth.privy.io/api/v1/apps/{PRIVY_APP_ID}/jwks.json") if PRIVY_APP_ID else None
 
 def authorized(authorization: str, x_qv_key: str) -> bool:
     expected = os.environ.get("QV_BACKEND_KEY")
-    if expected and x_qv_key == expected:
+    if expected and x_qv_key and x_qv_key == expected:
         return True
-    if _jwks and authorization:
-        token = authorization.replace("Bearer ", "").strip()
-        try:
-            key = _jwks.get_signing_key_from_jwt(token).key
-            jwt.decode(token, key, algorithms=["ES256"], audience=PRIVY_APP_ID, issuer="privy.io")
-            return True
-        except Exception:
-            return False
-    return not expected and not _jwks  # if nothing configured (dev), allow
+    if not PRIVY_APP_ID or _jwks is None:
+        print("[auth] PRIVY_APP_ID not set \u2014 cannot verify Privy token")
+        return not expected  # allow only if no auth is configured at all (dev)
+    token = (authorization or "").replace("Bearer ", "").strip()
+    if not token:
+        print("[auth] missing Bearer token")
+        return False
+    try:
+        key = _jwks.get_signing_key_from_jwt(token).key
+        jwt.decode(token, key, algorithms=["ES256"], audience=PRIVY_APP_ID, leeway=30)
+        return True
+    except Exception as ex:
+        print(f"[auth] Privy verify failed: {type(ex).__name__}: {ex}")
+        return False
 
 def guard(authorization, x_qv_key):
     if not authorized(authorization, x_qv_key):
