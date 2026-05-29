@@ -75,6 +75,7 @@ def guard(authorization, x_qv_key):
 
 # ---------- IBM service (cached) ----------
 IBM_INSTANCE = os.environ.get("IBM_INSTANCE", "").strip()
+IBM_BACKEND = os.environ.get("IBM_BACKEND", "").strip()  # pin ONE device by name -> avoids slow enumeration
 _service = None
 def service():
     global _service
@@ -98,7 +99,11 @@ def pick_backend(min_qubits):
     b = _backend_cache["b"]
     if b is not None and (now - _backend_cache["ts"]) < 300 and b.num_qubits >= min_qubits:
         return b
-    b = service().least_busy(operational=True, simulator=False, min_num_qubits=max(2, min_qubits))
+    svc = service()
+    if IBM_BACKEND:
+        b = svc.backend(IBM_BACKEND)          # target ONE device by name (no enumeration)
+    else:
+        b = svc.least_busy(operational=True, simulator=False, min_num_qubits=max(2, min_qubits))
     _backend_cache.update(b=b, ts=now)
     log.info("[ibm] picked backend=%s (%dq)", b.name, b.num_qubits)
     return b
@@ -181,6 +186,35 @@ def list_backends(t: int = 45):
                 "error": f"timed out contacting IBM (waited the full window). The instance is set but cannot list devices \u2014 likely the instance has no quantum systems attached / is not Active yet. On quantum.cloud.ibm.com open the instance and check it is Active and lists systems."}
     except Exception as e:
         return {"ok": False, "instance_set": bool(IBM_INSTANCE), "error": f"{type(e).__name__}: {e}"}
+
+def _backend_info(name):
+    b = service().backend(name)
+    return {"name": b.name, "qubits": b.num_qubits}
+
+@app.get("/whoami")
+def whoami():
+    """Tests ONLY service init (auth + account), no backend enumeration — should be quick if connectivity is fine."""
+    if not os.environ.get("IBM_QUANTUM_TOKEN"):
+        return {"ok": False, "error": "IBM_QUANTUM_TOKEN missing"}
+    try:
+        acct = _run_with_timeout(lambda: service().active_account(), 45)
+        safe = {k: v for k, v in (acct or {}).items() if k != "token"}
+        return {"ok": True, "account": safe}
+    except concurrent.futures.TimeoutError:
+        return {"ok": False, "error": "service init timed out (45s) — IBM auth/account fetch is slow from this host"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+@app.get("/backend/{name}")
+def one_backend(name: str):
+    """Tests fetching ONE backend by name (no enumeration). Use a QPU name from your IBM dashboard."""
+    try:
+        info = _run_with_timeout(lambda: _backend_info(name), 45)
+        return {"ok": True, **info}
+    except concurrent.futures.TimeoutError:
+        return {"ok": False, "error": f"fetching backend '{name}' timed out (45s)"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 @app.post("/submit")
 def submit(req: CircuitReq, authorization: str = Header(default=""), x_qv_key: str = Header(default="")):
