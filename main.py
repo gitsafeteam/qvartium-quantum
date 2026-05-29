@@ -168,16 +168,17 @@ def _run_with_timeout(fn, seconds):
         ex.shutdown(wait=False)
 
 @app.get("/backends")
-def list_backends():
+def list_backends(t: int = 45):
     """Public — actually contacts IBM and lists real devices. Slow if IBM_INSTANCE is missing/invalid."""
     if not os.environ.get("IBM_QUANTUM_TOKEN"):
         return {"ok": False, "error": "IBM_QUANTUM_TOKEN missing"}
     try:
-        names = _run_with_timeout(lambda: [b.name for b in service().backends(operational=True, simulator=False)], 35)
+        secs = max(5, min(int(t), 120))
+        names = _run_with_timeout(lambda: [b.name for b in service().backends(operational=True, simulator=False)], secs)
         return {"ok": True, "instance_set": bool(IBM_INSTANCE), "backends": names}
     except concurrent.futures.TimeoutError:
         return {"ok": False, "instance_set": bool(IBM_INSTANCE),
-                "error": "timed out after 35s contacting IBM. The instance is set but cannot list devices \u2014 likely the instance has no quantum systems attached / is not Active yet. On quantum.cloud.ibm.com open the instance and check it is Active and lists systems."}
+                "error": f"timed out contacting IBM (waited the full window). The instance is set but cannot list devices \u2014 likely the instance has no quantum systems attached / is not Active yet. On quantum.cloud.ibm.com open the instance and check it is Active and lists systems."}
     except Exception as e:
         return {"ok": False, "instance_set": bool(IBM_INSTANCE), "error": f"{type(e).__name__}: {e}"}
 
@@ -186,7 +187,7 @@ def submit(req: CircuitReq, authorization: str = Header(default=""), x_qv_key: s
     guard(authorization, x_qv_key)
     qc = build_circuit(req)
     try:
-        backend = _run_with_timeout(lambda: pick_backend(req.qubits), 45)
+        backend = _run_with_timeout(lambda: pick_backend(req.qubits), 90)
     except concurrent.futures.TimeoutError:
         raise HTTPException(status_code=504, detail="ibm_timeout: backend selection timed out (instance not responding)")
     except Exception as e:
