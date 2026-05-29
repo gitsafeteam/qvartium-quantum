@@ -147,16 +147,26 @@ def extract_counts(res):
 
 @app.get("/health")
 def health():
-    """Public — open https://<your-render-url>/health in a browser to test IBM connectivity."""
+    """Public, INSTANT — shows config only (never calls IBM, so it can't hang)."""
+    return {
+        "ok": True,
+        "token_set": bool(os.environ.get("IBM_QUANTUM_TOKEN")),
+        "instance_set": bool(IBM_INSTANCE),
+        "instance_preview": (IBM_INSTANCE[:48] + "\u2026") if IBM_INSTANCE else None,
+        "privy_set": bool(PRIVY_APP_ID),
+        "hint": "open /backends to test the IBM connection (can take ~30s; needs IBM_INSTANCE set)",
+    }
+
+@app.get("/backends")
+def list_backends():
+    """Public — actually contacts IBM and lists real devices. Slow if IBM_INSTANCE is missing/invalid."""
     if not os.environ.get("IBM_QUANTUM_TOKEN"):
         return {"ok": False, "error": "IBM_QUANTUM_TOKEN missing"}
-    out = {"ok": True, "instance_set": bool(IBM_INSTANCE), "privy_set": bool(PRIVY_APP_ID)}
     try:
-        out["backends"] = [b.name for b in service().backends(operational=True, simulator=False)]
+        names = [b.name for b in service().backends(operational=True, simulator=False)]
+        return {"ok": True, "instance_set": bool(IBM_INSTANCE), "backends": names}
     except Exception as e:
-        out["ok"] = False
-        out["error"] = f"{type(e).__name__}: {e}"
-    return out
+        return {"ok": False, "instance_set": bool(IBM_INSTANCE), "error": f"{type(e).__name__}: {e}"}
 
 @app.post("/submit")
 def submit(req: CircuitReq, authorization: str = Header(default=""), x_qv_key: str = Header(default="")):
