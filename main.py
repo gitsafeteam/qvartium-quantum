@@ -206,13 +206,14 @@ def whoami():
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 @app.get("/backend/{name}")
-def one_backend(name: str):
+def one_backend(name: str, t: int = 45):
     """Tests fetching ONE backend by name (no enumeration). Use a QPU name from your IBM dashboard."""
     try:
-        info = _run_with_timeout(lambda: _backend_info(name), 45)
+        secs = max(5, min(int(t), 120))
+        info = _run_with_timeout(lambda: _backend_info(name), secs)
         return {"ok": True, **info}
     except concurrent.futures.TimeoutError:
-        return {"ok": False, "error": f"fetching backend '{name}' timed out (45s)"}
+        return {"ok": False, "error": f"fetching backend '{name}' timed out (waited the full window)"}
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
